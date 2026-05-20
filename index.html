@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>QUIZALONE</title>
+
+<style>
+body {
+    font-family: sans-serif;
+    margin: 20px;
+    line-height: 1.8;
+}
+
+.file-input-area {
+    background: #f0f4f8;
+    border: 2px dashed #b0c4de;
+    padding: 15px;
+    margin-bottom: 20px;
+    border-radius: 5px;
+    text-align: center;
+}
+
+button {
+    font-size: 20px;
+    padding: 14px 22px;
+    margin: 10px 0;
+    width: 100%;
+}
+
+button:disabled {
+    background: #e0e0e0;
+    color: #a0a0a0;
+    cursor: not-allowed;
+}
+
+#status {
+    margin-top: 20px;
+    font-size: 18px;
+    font-weight: bold;
+    text-align: center;
+    padding: 10px;
+    background: #fdf5e6;
+    border-radius: 5px;
+}
+
+#log {
+    margin-top: 20px;
+    border: 1px solid #ccc;
+    padding: 10px;
+    height: 220px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+}
+</style>
+</head>
+
+<body>
+
+<h1>QUIZALONE</h1>
+
+<div class="file-input-area">
+    <p style="margin: 0 0 10px 0; font-weight: bold;">最初にCSVファイル（1列目に問題、2列目に解答が入力されたもの）を選択してください。<br>
+CSVファイルを選択する時とそれ以降はオフラインで動作するので、ファイルが外部に送信・保存されることはありません。
+</p>
+    <input type="file" id="csvFile" accept=".csv">
+</div>
+
+<p>
+「問題読み上げ」ボタンを押すと、音声のみで出題します。<br>
+問題読み上げ中に「回答する」を押すと、読み上げを止めて回答できます。<br>
+「回答する」を押してから5秒以内に回答できない場合、問題を読み終わってから「回答する」が5秒以上押されない場合は不正解となります。<br>
+イヤホン必須です。<br>
+回答時は、正確に音声を認識してもらうためにゆっくりはっきり発音してください。<br>
+Safari（iPhone・Mac）、GoogleChrome（Mac）で動作することが確認されています。<br>
+音声読み上げ・音声認識機能の限界により、問題や解答の読みや正誤判定を誤る場合があります。
+</p>
+
+<button id="nextBtn" disabled>問題読み上げ</button>
+<button id="answerBtn" disabled>回答する</button>
+
+<div id="status">CSVファイルを読み込んでください</div>
+<div id="log">--- ログ ---</div>
+
+<script>
+let quizData = []; 
+let currentQuestion = null;
+let listening = false; 
+let timeoutId = null; 
+let isWaitingForAnswerBtn = false; 
+let currentAudio = null; 
+
+// 【設定】VOICEVOXのキャラクターID（7: 玄野武宏 爽やかな男性青年ボイス）
+const VOICEVOX_SPEAKER_ID = 7; 
+
+const csvFileInput = document.getElementById("csvFile");
+const statusEl = document.getElementById("status");
+const logEl = document.getElementById("log");
+const nextBtn = document.getElementById("nextBtn");
+const answerBtn = document.getElementById("answerBtn");
+
+function log(msg) {
+    logEl.textContent += "\n" + msg;
+    logEl.scrollTop = logEl.scrollHeight;
+}
+
+// 1. CSVファイルを読み込んで解析する処理
+csvFileInput.onchange = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = function(event) {
+        const text = event.target.result;
+        const lines = text.split(/\r\n|\n/);
+        quizData = [];
+
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i].trim();
+            if (!line) continue; 
+
+            const parts = line.split(",");
+            if (parts.length >= 2) {
+                const question = parts[0].replace(/^["']|["']$/g, "").trim();
+                const answer = parts[1].replace(/^["']|["']$/g, "").trim();
+                
+                if (question && answer) {
+                    quizData.push({ question: question, answer: answer });
+                }
+            }
+        }
+
+        if (quizData.length > 0) {
+            statusEl.textContent = `待機中 (${quizData.length}問のクイズを読み込みました！)`;
+            log(`システム: ${quizData.length}問のデータを正常に読み込みました。いつでもスタートできます。`);
+            nextBtn.disabled = false;
+            answerBtn.disabled = false;
+        } else {
+            statusEl.textContent = "クイズデータを読み込めませんでした。CSVの形式を確認してください。";
+        }
+    };
+    
+    reader.readAsText(file, "UTF-8");
+};
+
+// 2. VOICEVOX Web API を使った音声読み上げ処理
+async function speak(text, callback) {
+    stopSpeaking(); 
+    try {
+        const url = `https://voicevox.su-shiki.com/api/tts?text=${encodeURIComponent(text)}&speaker=${VOICEVOX_SPEAKER_ID}`;
+        currentAudio = new Audio(url);
+        currentAudio.onended = () => {
+            if (callback) callback();
+        };
+        await currentAudio.play();
+    } catch (error) {
+        console.error("音声再生エラー:", error);
+        const utterance = new SpeechSynthesisUtterance(text);
+        utterance.lang = "ja-JP";
+        utterance.onend = () => { if (callback) callback(); };
+        window.speechSynthesis.speak(utterance);
+    }
+}
+
+function stopSpeaking() {
+    if (currentAudio) {
+        currentAudio.pause();
+        currentAudio.currentTime = 0;
+    }
+    if (window.speechSynthesis.speaking) {
+        window.speechSynthesis.cancel();
+    }
+}
+
+// 3. 音声認識 (Speech Recognition) の設定
+const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+const recognition = new SpeechRecognition();
+recognition.lang = "ja-JP";
+recognition.continuous = false; 
+recognition.interimResults = false; 
+
+// 4. クイズの制御ロジック
+function randomQuestion() {
+    const idx = Math.floor(Math.random() * quizData.length);
+    return quizData[idx];
+}
+
+// 強化した正規化関数
+function cleanText(str) {
+    return str.toLowerCase()
+              .replace(/[\u3041-\u3096]/g, m => String.fromCharCode(m.charCodeAt(0) + 0x60))
+              .replace(/[！-～]/g, m => String.fromCharCode(m.charCodeAt(0) - 0x60) )
+              .replace(/[、。？\?\s\(\)（）「」『』\-ー_]/g, "");
+}
+
+function askQuestion() {
+    stopSpeaking();
+    clearTimeout(timeoutId); 
+    isWaitingForAnswerBtn = false;
+    
+    if (listening) {
+        try { recognition.abort(); } catch(e){}
+        listening = false;
+    }
+
+    currentQuestion = randomQuestion();
+    
+    log("-------------------------");
+    log("システム: 新しい問題を出題しました");
+    statusEl.textContent = "問題生成中...";
+
+    speak("問題。" + currentQuestion.question, () => {
+        statusEl.textContent = "「回答する」ボタンを押して答えてください (制限時間5秒)";
+        isWaitingForAnswerBtn = true;
+
+        timeoutId = setTimeout(() => {
+            if (isWaitingForAnswerBtn) {
+                isWaitingForAnswerBtn = false;
+                statusEl.textContent = "時間切れ（不正解）";
+                log("判定: 回答ボタン押下なし（時間切れ）");
+                
+                speak("不正解です。正解は " + currentQuestion.answer + " です", () => {
+                    setTimeout(askQuestion, 1200); 
+                });
+            }
+        }, 5000);
+    });
+}
+
+nextBtn.onclick = () => {
+    if (quizData.length === 0) return;
+    askQuestion();
+};
+
+answerBtn.onclick = () => {
+    if (!currentQuestion) {
+        alert("先に問題を出してください");
+        return;
+    }
+
+    stopSpeaking(); 
+    clearTimeout(timeoutId); 
+    isWaitingForAnswerBtn = false;
+
+    if (listening) return; 
+
+    listening = true;
+    statusEl.textContent = "音声認識中... (5秒以内に回答してください)";
+
+    try {
+        recognition.start();
+    } catch (e) {
+        console.log("マイク起動エラー:", e);
+    }
+
+    timeoutId = setTimeout(() => {
+        if (listening) {
+            listening = false;
+            statusEl.textContent = "時間切れ（不正解）";
+            log("判定: 時間切れ");
+            try { recognition.abort(); } catch(e){} 
+            speak("不正解です。正解は " + currentQuestion.answer + " です", () => {
+                setTimeout(askQuestion, 1200); 
+            });
+        }
+    }, 5000);
+};
+
+// 音声を聞き取ったときの処理
+recognition.onresult = (event) => {
+    if (!listening) return;
+
+    clearTimeout(timeoutId);
+    listening = false;
+
+    const transcript = event.results[0][0].transcript.trim();
+    if (!transcript) {
+        statusEl.textContent = "聞き取れませんでした（不正解）";
+        log("判定: 空の入力");
+        speak("不正解です。正解は " + currentQuestion.answer + " です", () => {
+            setTimeout(askQuestion, 1200);
+        });
+        return;
+    }
+
+    log("あなた(認識結果): " + transcript);
+
+    const uAns = cleanText(transcript);
+    const cAns = cleanText(currentQuestion.answer);
+
+    let isCorrect = uAns.includes(cAns) || cAns.includes(uAns);
+
+    if (!isCorrect) {
+        let matchCount = 0;
+        for (let char of currentQuestion.answer) {
+            if (transcript.includes(char) && !"、。?？".includes(char)) {
+                matchCount++;
+            }
+        }
+        if (matchCount >= Math.min(2, currentQuestion.answer.length)) {
+            isCorrect = true;
+        }
+    }
+
+    if (isCorrect) {
+        statusEl.textContent = "正解！";
+        log("判定: 正解 (" + currentQuestion.answer + ")");
+        speak("正解です", () => {
+            setTimeout(askQuestion, 1200); 
+        });
+    } else {
+        statusEl.textContent = "不正解";
+        log("判定: 不正解");
+        speak("不正解です。正解は " + currentQuestion.answer + " です", () => {
+            setTimeout(askQuestion, 1200); 
+        });
+    }
+};
+
+recognition.onerror = (event) => {
+    console.log("音声認識エラー:", event.error);
+};
+</script>
+
+</body>
+</html>
