@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>QUIZALONE</title>
+
+<script src="https://cdn.jsdelivr.net/npm/kuroshiro@1.2.0/dist/kuroshiro.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/kuroshiro-analyzer-kuromoji@1.1.0/dist/kuroshiro-analyzer-kuromoji.min.js"></script>
+
+<style>
+body {
+    font-family: sans-serif;
+    margin: 20px;
+    line-height: 1.8;
+}
+
+.file-input-area {
+    background: #f0f4f8;
+    border: 2px dashed #b0c4de;
+    padding: 15px;
+    margin-bottom: 20px;
+    border-radius: 5px;
+    text-align: center;
+}
+
+button {
+    font-size: 20px;
+    padding: 14px 22px;
+    margin: 10px 0;
+    width: 100%;
+}
+
+button:disabled {
+    background: #e0e0e0;
+    color: #a0a0a0;
+    cursor: not-allowed;
+}
+
+#status {
+    margin-top: 20px;
+    font-size: 18px;
+    font-weight: bold;
+    text-align: center;
+    padding: 10px;
+    background: #fdf5e6;
+    border-radius: 5px;
+}
+
+#log {
+    margin-top: 20px;
+    border: 1px solid #ccc;
+    padding: 10px;
+    height: 220px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+}
+</style>
+</head>
+
+<body>
+
+<h1>QUIZALONE</h1>
+
+<div class="file-input-area">
+    <p style="margin: 0 0 10px 0; font-weight: bold;">最初にCSVファイル（1列目に問題、2列目に解答が入力されたもの）を選択してください。<br>
+CSVファイルを選択する時とそれ以降はオフラインで動作するので、ファイルが外部に送信・保存されることはありません。
+</p>
+    <input type="file" id="csvFile" accept=".csv">
+</div>
+
+<p>
+「問題読み上げ」ボタンを押すと、音声のみで出題します。<br>
+問題読み上げ中に「回答する」を押すかEnterキーを押すと、読み上げを止めて回答できます。<br>
+「回答する」を押してから5秒間回答がない場合、問題を読み上げてから5秒間「回答する」が押されなかった場合は、不正解となります。<br>
+回答時は、正確に音声を認識してもらうためにはっきり発音してください。<br>
+Safari（iPhone・Mac）、GoogleChrome（Mac）で動作することが確認されています（おそらくGoogleChromeであればどの端末でも動作します）。<br>
+音声読み上げ・音声認識機能の限界により、問題や解答の読みや正誤判定を誤る場合があります。
+</p>
+
+<button id="nextBtn" disabled>問題読み上げ</button>
+<button id="answerBtn" disabled>回答する</button>
+
+<div id="status">システムを起動しています...</div>
+<div id="log">--- ログ ---</div>
+
+<script>
+let quizData = []; 
+let availableQuestions = []; 
+let currentQuestion = null;
+let listening = false; 
+let timeoutId = null; 
+let isWaitingForAnswerBtn = false; 
+let selectedMaleVoice = null; 
+
+// Kuroshiroインスタンスの準備
+const kuroshiro = new Kuroshiro();
+let isKuroshiroReady = false;
+
+const csvFileInput = document.getElementById("csvFile");
+const statusEl = document.getElementById("status");
+const logEl = document.getElementById("log");
+const nextBtn = document.getElementById("nextBtn");
+const answerBtn = document.getElementById("answerBtn");
+
+function log(msg) {
+    logEl.textContent += "\n" + msg;
+    logEl.scrollTop = logEl.scrollHeight;
+}
+
+// 起動時に自動で日本語形態素解析エンジンを初期化（フォールバックなし）
+async function initKuroshiro() {
+    try {
+        statusEl.textContent = "日本語解析エンジンを起動中...";
+        
+        // 外部サーバー（CDN）から辞書データを100%読み込み完了するまで待機
+        await kuroshiro.init(new KuromojiAnalyzer({
+            dictPath: "https://cdn.jsdelivr.net/npm/kuromoji@0.1.12/dict"
+        }));
+        
+        isKuroshiroReady = true;
+        statusEl.textContent = "CSVファイルを読み込んでください";
+        log("システム: 日本語自動ひらがな化エンジン（Kuroshiro）が正常に起動しました。音素ベースの正確な比較が可能です。");
+    } catch (err) {
+        statusEl.textContent = "エンジン起動失敗（通信環境を確認し、リロードしてください）";
+        log("システムエラー: 辞書の読込に失敗しました。ネット接続を確認してください: " + err);
+    }
+}
+initKuroshiro();
+
+// 内蔵男性音声の自動捜索
+function findBestMaleVoice() {
+    const voices = window.speechSynthesis.getVoices();
+    const targetNames = ["Otoya", "Google 日本語", "Ichiro", "Microsoft Ichiro", "Keita"];
+    for (let name of targetNames) {
+        const found = voices.find(v => v.name.includes(name) && v.lang.includes("ja"));
+        if (found) {
+            selectedMaleVoice = found;
+            break;
+        }
+    }
+}
+window.speechSynthesis.onvoiceschanged = findBestMaleVoice;
+findBestMaleVoice();
+
+// 1. CSVファイルを読み込んで解析する処理
+csvFileInput.onchange = (e) => {
+    // 辞書エンジンの準備ができていない場合はファイル選択を無視、または警告
+    if (!isKuroshiroReady) {
+        alert("日本語解析エンジンの起動を待ってからファイルを選択してください。");
+        csvFileInput.value = "";
+        return;
+    }
+
+    const file = e.target.files[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = function(event) {
+        const text = event.target.result;
+        const lines = text.split(/\r\n|\n/);
+        quizData = [];
+
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i].trim();
+            if (!line) continue; 
+
+            const parts = line.split(",");
+            if (parts.length >= 2) {
+                const question = parts[0].replace(/^["']|["']$/g, "").trim();
+                const answer = parts[1].replace(/^["']|["']$/g, "").trim();
+                
+                if (question && answer) {
+                    quizData.push({ question: question, answer: answer });
+                }
+            }
+        }
+
+        if (quizData.length > 0) {
+            findBestMaleVoice();
+            availableQuestions = [...quizData];
+            statusEl.textContent = `待機中 (${quizData.length}問のクイズを読み込みました！)`;
+            nextBtn.disabled = false;
+            answerBtn.disabled = false;
+            log(`システム: ${quizData.length}問のデータを正常に読み込みました。いつでもスタートできます。`);
+        }
+    };
+    reader.readAsText(file, "UTF-8");
+};
+
+// 2. 音声読み上げ処理
+function speak(text, callback) {
+    stopSpeaking(); 
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.lang = "ja-JP";
+    if (selectedMaleVoice) utterance.voice = selectedMaleVoice;
+    utterance.onend = () => { if (callback) callback(); };
+    window.speechSynthesis.speak(utterance);
+}
+
+function stopSpeaking() {
+    if (window.speechSynthesis.speaking) window.speechSynthesis.cancel();
+}
+
+// 3. 音声認識の設定
+const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+const recognition = new SpeechRecognition();
+recognition.lang = "ja-JP";
+recognition.continuous = false; 
+recognition.interimResults = false; 
+recognition.maxAlternatives = 10; 
+
+// Enterキーの連動イベント
+window.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+        if (!answerBtn.disabled) {
+            answerBtn.click();
+        }
+    }
+});
+
+// 重複なしランダム抽出処理
+function randomQuestion() {
+    if (availableQuestions.length === 0) {
+        log("システム: すべての問題が出題されました。問題をリセットして最初から再配置します。");
+        availableQuestions = [...quizData];
+    }
+    
+    const idx = Math.floor(Math.random() * availableQuestions.length);
+    const selected = availableQuestions[idx];
+    availableQuestions.splice(idx, 1);
+    return selected;
+}
+
+// 基本クレンジング関数
+function cleanText(str) {
+    if (!str) return "";
+    let text = str.trim().toLowerCase();
+    text = text.replace(/[\s\u3000\t\r\n・\.\微| ｜]/g, "");
+    text = text.replace(/[、。？\?\(\)（）「」『』\-ー_]/g, "");
+    return text;
+}
+
+// 超高精度・Kuroshiroひらがな化仲介関数
+async function convertToHiragana(text) {
+    const cleaned = cleanText(text);
+    if (!cleaned) return "";
+
+    try {
+        const result = await kuroshiro.convert(cleaned, { to: "hiragana", mode: "normal" });
+        return result;
+    } catch (e) {
+        return cleaned;
+    }
+}
+
+// 4. クイズの制御ロジック
+function askQuestion() {
+    stopSpeaking();
+    clearTimeout(timeoutId); 
+    isWaitingForAnswerBtn = false;
+    
+    if (listening) {
+        try { recognition.abort(); } catch(e){}
+        listening = false;
+    }
+
+    currentQuestion = randomQuestion();
+    
+    log("-------------------------");
+    log("システム: 新しい問題を出題しました");
+    statusEl.textContent = "問題読み上げ中...";
+
+    speak("問題。" + currentQuestion.question, () => {
+        statusEl.textContent = "「回答する」ボタン（またはEnterキー）を押して答えてください (制限時間5秒)";
+        isWaitingForAnswerBtn = true;
+
+        timeoutId = setTimeout(() => {
+            if (isWaitingForAnswerBtn) {
+                isWaitingForAnswerBtn = false;
+                statusEl.textContent = "時間切れ（不正解）";
+                log("判定: 不正解（" + currentQuestion.answer + "） [理由: 回答ボタン押下なし]");
+                
+                speak("不正解です。正解は " + currentQuestion.answer + " です", () => {
+                    setTimeout(askQuestion, 1200); 
+                });
+            }
+        }, 5000);
+    });
+}
+
+nextBtn.onclick = () => {
+    nextBtn.blur(); 
+    if (quizData.length === 0) return;
+    askQuestion();
+};
+
+answerBtn.onclick = () => {
+    answerBtn.blur(); 
+    if (!currentQuestion) return;
+    stopSpeaking(); 
+    clearTimeout(timeoutId); 
+    isWaitingForAnswerBtn = false;
+    if (listening) return; 
+
+    listening = true;
+    statusEl.textContent = "音声認識中... (5秒以内に回答してください)";
+    try { recognition.start(); } catch (e) {}
+
+    timeoutId = setTimeout(() => {
+        if (listening) {
+            listening = false;
+            statusEl.textContent = "時間切れ（不正解）";
+            try { recognition.abort(); } catch(e){} 
+            log("判定: 不正解（" + currentQuestion.answer + "） [理由: 発言なし時間切れ]");
+            
+            speak("不正解です。正解は " + currentQuestion.answer + " です", () => {
+                setTimeout(askQuestion, 1200); 
+            });
+        }
+    }, 5000);
+};
+
+// 音声を聞き取ったときの処理
+recognition.onresult = async (event) => {
+    if (!listening) return;
+    clearTimeout(timeoutId);
+    listening = false;
+
+    const transcript = event.results[0][0].transcript.trim();
+    if (!transcript) {
+        statusEl.textContent = "聞き取れませんでした";
+        log("判定: 不正解（" + currentQuestion.answer + "） [理由: 音声認識不能]");
+        
+        speak("不正解です。正解は " + currentQuestion.answer + " です", () => {
+            setTimeout(askQuestion, 1200);
+        });
+        return;
+    }
+
+    log("あなた(認識結果): " + transcript);
+
+    let isCorrect = false;
+    
+    // CSVの答え（漢字含む）をひらがなに変換
+    const processedCsvAnswer = await convertToHiragana(currentQuestion.answer);
+
+    // マイクが聞き取った最大10個の全表記候補をループ処理
+    for (let i = 0; i < event.results[0].length; i++) {
+        let rawAlternative = event.results[0][i].transcript;
+        if (!rawAlternative) continue;
+        
+        // マイクの回答もひらがなに変換
+        let processedAlternative = await convertToHiragana(rawAlternative);
+        
+        // 部分一致・内包チェック
+        const isMatch = (processedAlternative.length >= 2 && processedCsvAnswer.includes(processedAlternative)) || 
+                        (processedCsvAnswer.length >= 2 && processedAlternative.includes(processedCsvAnswer));
+
+        if (isMatch) {
+            isCorrect = true;
+            break;
+        }
+    }
+
+    if (isCorrect) {
+        statusEl.textContent = "正解！";
+        log("判定: 正解 (" + currentQuestion.answer + ")");
+        speak("正解です", () => {
+            setTimeout(askQuestion, 1200); 
+        });
+    } else {
+        statusEl.textContent = "不正解";
+        log("判定: 不正解（" + currentQuestion.answer + "）");
+        
+        speak("不正解です。正解は " + currentQuestion.answer + " です", () => {
+            setTimeout(askQuestion, 1200); 
+        });
+    }
+};
+</script>
+
+</body>
+</html>
